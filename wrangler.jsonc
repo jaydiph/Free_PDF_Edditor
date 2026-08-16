@@ -4,7 +4,5 @@
   "compatibility_date": "2026-08-01",
   "assets": {
     "directory": "./dist"
-// wrangler.jsonc
-"name": "free-pdf-edditor",
   }
 }
