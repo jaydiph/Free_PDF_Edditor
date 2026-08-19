@@ -1223,34 +1223,627 @@ export async function applyFullPdfEdits(file, { elements = [], pageDrawings = {}
 }
 
 /**
- * Convert PDF to Word (.doc / .docx)
+ * Helper: XML escape for OpenXML / DOCX
  */
-export async function convertPdfToWord(file) {
-  const { extractTextFromPdf } = await import('./pdfViewerEngine');
-  const extResult = await extractTextFromPdf(file, 'txt');
-  const text = extResult.text;
+function xmlEscape(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;')
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+}
 
-  // Build clean Word-compatible HTML/DOC document
-  const wordDocContent = `
+/**
+ * Helper: Clean and normalize font family names
+ */
+function cleanFontFamily(rawName) {
+  if (!rawName) return 'Calibri';
+  const lower = rawName.toLowerCase();
+  if (lower.includes('times') || lower.includes('serif') || lower.includes('cambria') || lower.includes('garamond')) {
+    return 'Times New Roman';
+  }
+  if (lower.includes('courier') || lower.includes('mono') || lower.includes('consolas') || lower.includes('menlo')) {
+    return 'Courier New';
+  }
+  if (lower.includes('arial') || lower.includes('helvetica')) {
+    return 'Arial';
+  }
+  if (lower.includes('georgia')) return 'Georgia';
+  if (lower.includes('verdana')) return 'Verdana';
+  if (lower.includes('tahoma')) return 'Tahoma';
+  if (lower.includes('trebuchet')) return 'Trebuchet MS';
+  return 'Calibri';
+}
+
+/**
+ * Helper: Extract layout structure and text items for a PDF page
+ */
+async function analyzePageLayout(pdfPage, scale = 1.0) {
+  const viewport = pdfPage.getViewport({ scale });
+  const textContent = await pdfPage.getTextContent({ includeMarkedContent: true });
+  const styles = textContent.styles || {};
+  const rawItems = [];
+
+  for (const item of textContent.items) {
+    const str = item.str;
+    if (!str || !str.trim()) continue;
+
+    const tx = item.transform;
+    const itemX = tx[4];
+    const itemY = tx[5];
+    const fontSize = Math.hypot(tx[2], tx[3]) || Math.abs(tx[0]) || 12;
+    const fontName = item.fontName || '';
+    const styleObj = styles[fontName] || {};
+    const fontFam = cleanFontFamily(styleObj.fontFamily || fontName);
+    const isBold = /bold|black|heavy|semibold|700|800|900/i.test(fontName) || /bold/i.test(styleObj.fontFamily || '');
+    const isItalic = /italic|oblique/i.test(fontName) || /italic/i.test(styleObj.fontFamily || '');
+    const yTop = viewport.height - itemY - fontSize;
+    const width = item.width || (str.length * fontSize * 0.52);
+
+    rawItems.push({
+      str,
+      x: itemX,
+      y: yTop,
+      width,
+      height: fontSize * 1.2,
+      fontSize: Math.round(fontSize * 10) / 10,
+      fontFamily: fontFam,
+      isBold,
+      isItalic,
+      color: '#1e293b'
+    });
+  }
+
+  // Sort vertically by top-to-bottom
+  rawItems.sort((a, b) => a.y - b.y || a.x - b.x);
+
+  // Group into lines
+  const lines = [];
+  for (const item of rawItems) {
+    let matchedLine = null;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const l = lines[i];
+      const tolerance = Math.min(item.fontSize, l.avgFontSize) * 0.48;
+      if (Math.abs(item.y - l.avgY) <= tolerance) {
+        matchedLine = l;
+        break;
+      }
+      if (item.y - l.avgY > 30) break;
+    }
+
+    if (matchedLine) {
+      matchedLine.items.push(item);
+      matchedLine.avgY = (matchedLine.avgY * (matchedLine.items.length - 1) + item.y) / matchedLine.items.length;
+      matchedLine.avgFontSize = Math.max(matchedLine.avgFontSize, item.fontSize);
+      matchedLine.isBold = matchedLine.isBold && item.isBold;
+    } else {
+      lines.push({
+        avgY: item.y,
+        avgFontSize: item.fontSize,
+        isBold: item.isBold,
+        items: [item]
+      });
+    }
+  }
+
+  // Process and sort items within each line
+  const processedLines = [];
+  for (const line of lines) {
+    line.items.sort((a, b) => a.x - b.x);
+
+    // Merge adjacent tokens or insert spaces
+    const mergedRuns = [];
+    let curRun = null;
+    let minX = Infinity;
+    let maxX = -Infinity;
+
+    for (let i = 0; i < line.items.length; i++) {
+      const item = line.items[i];
+      minX = Math.min(minX, item.x);
+      maxX = Math.max(maxX, item.x + item.width);
+
+      if (!curRun) {
+        curRun = { ...item };
+      } else {
+        const gap = item.x - (curRun.x + curRun.width);
+        const sameFormat = curRun.fontFamily === item.fontFamily &&
+                           Math.abs(curRun.fontSize - item.fontSize) < 1 &&
+                           curRun.isBold === item.isBold &&
+                           curRun.isItalic === item.isItalic;
+
+        if (sameFormat && gap < item.fontSize * 1.6 && gap >= -2) {
+          const needsSpace = gap > 1.5 && !curRun.str.endsWith(' ') && !item.str.startsWith(' ');
+          curRun.str += (needsSpace ? ' ' : '') + item.str;
+          curRun.width = (item.x + item.width) - curRun.x;
+        } else {
+          mergedRuns.push(curRun);
+          curRun = { ...item };
+        }
+      }
+    }
+    if (curRun) mergedRuns.push(curRun);
+
+    const fullLineText = mergedRuns.map(r => r.str).join(' ').trim();
+    if (!fullLineText) continue;
+
+    const lineWidth = maxX - minX;
+    let alignment = 'left';
+    if (Math.abs((minX + maxX) / 2 - viewport.width / 2) < 25 && lineWidth < viewport.width * 0.75) {
+      alignment = 'center';
+    } else if (viewport.width - maxX < 55 && minX > viewport.width * 0.35) {
+      alignment = 'right';
+    }
+
+    const isHeading = line.avgFontSize >= 15 || (line.isBold && line.avgFontSize >= 13);
+    const headingLevel = line.avgFontSize >= 20 ? 1 : line.avgFontSize >= 16 ? 2 : isHeading ? 3 : 0;
+    const isBullet = /^[\u2022\u2013\u2014\*\-o\u25AA]|\d+[\.\)]\s/.test(fullLineText);
+
+    // Detect column gaps for table detection
+    const columnGaps = [];
+    for (let r = 0; r < mergedRuns.length - 1; r++) {
+      const gap = mergedRuns[r + 1].x - (mergedRuns[r].x + mergedRuns[r].width);
+      if (gap > 22) {
+        columnGaps.push({ gapX: mergedRuns[r + 1].x, gapSize: gap });
+      }
+    }
+
+    processedLines.push({
+      y: line.avgY,
+      minX,
+      maxX,
+      width: lineWidth,
+      avgFontSize: line.avgFontSize,
+      runs: mergedRuns,
+      fullText: fullLineText,
+      alignment,
+      isHeading,
+      headingLevel,
+      isBullet,
+      columnGaps
+    });
+  }
+
+  // Structure lines into blocks (Paragraphs, Headings, Tables, Lists)
+  const blocks = [];
+  let currentTableLines = [];
+
+  const flushTable = () => {
+    if (currentTableLines.length > 0) {
+      const tableRows = currentTableLines.map(tLine => {
+        return tLine.runs.map(r => ({
+          text: r.str,
+          fontSize: r.fontSize,
+          fontFamily: r.fontFamily,
+          isBold: r.isBold,
+          isItalic: r.isItalic
+        }));
+      });
+      blocks.push({
+        type: 'table',
+        rows: tableRows
+      });
+      currentTableLines = [];
+    }
+  };
+
+  for (let i = 0; i < processedLines.length; i++) {
+    const curLine = processedLines[i];
+
+    if (curLine.columnGaps.length >= 1 && !curLine.isHeading) {
+      currentTableLines.push(curLine);
+      continue;
+    } else if (currentTableLines.length >= 2) {
+      flushTable();
+    } else if (currentTableLines.length === 1) {
+      const singleLine = currentTableLines[0];
+      currentTableLines = [];
+      blocks.push({
+        type: singleLine.headingLevel > 0 ? 'heading' : (singleLine.isBullet ? 'bullet' : 'paragraph'),
+        headingLevel: singleLine.headingLevel,
+        alignment: singleLine.alignment,
+        runs: singleLine.runs,
+        fullText: singleLine.fullText,
+        y: singleLine.y
+      });
+    }
+
+    if (curLine.headingLevel > 0) {
+      blocks.push({
+        type: 'heading',
+        headingLevel: curLine.headingLevel,
+        alignment: curLine.alignment,
+        runs: curLine.runs,
+        fullText: curLine.fullText,
+        y: curLine.y
+      });
+    } else if (curLine.isBullet) {
+      blocks.push({
+        type: 'bullet',
+        alignment: curLine.alignment,
+        runs: curLine.runs,
+        fullText: curLine.fullText,
+        y: curLine.y
+      });
+    } else {
+      blocks.push({
+        type: 'paragraph',
+        alignment: curLine.alignment,
+        runs: curLine.runs,
+        fullText: curLine.fullText,
+        y: curLine.y
+      });
+    }
+  }
+
+  flushTable();
+
+  return {
+    pageWidth: viewport.width,
+    pageHeight: viewport.height,
+    lines: processedLines,
+    blocks
+  };
+}
+
+/**
+ * Build official OpenXML (.docx) ZIP package
+ */
+async function buildDocxArchive(pagesData, docTitle) {
+  const zip = new JSZip();
+
+  // 1. [Content_Types].xml
+  zip.file('[Content_Types].xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+</Types>`);
+
+  // 2. _rels/.rels
+  zip.file('_rels/.rels', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>`);
+
+  // 3. word/_rels/document.xml.rels
+  zip.file('word/_rels/document.xml.rels', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>`);
+
+  // 4. word/styles.xml
+  zip.file('word/styles.xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:docDefaults>
+    <w:rPrDefault>
+      <w:rPr>
+        <w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/>
+        <w:sz w:val="22"/>
+        <w:color w:val="1E293B"/>
+      </w:rPr>
+    </w:rPrDefault>
+  </w:docDefaults>
+  <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+    <w:name w:val="Normal"/>
+    <w:qFormat/>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading1">
+    <w:name w:val="heading 1"/>
+    <w:basedOn w:val="Normal"/>
+    <w:qFormat/>
+    <w:rPr>
+      <w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/>
+      <w:b/>
+      <w:sz w:val="38"/>
+      <w:color w:val="1E3A8A"/>
+    </w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading2">
+    <w:name w:val="heading 2"/>
+    <w:basedOn w:val="Normal"/>
+    <w:qFormat/>
+    <w:rPr>
+      <w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/>
+      <w:b/>
+      <w:sz w:val="30"/>
+      <w:color w:val="1E3A8A"/>
+    </w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading3">
+    <w:name w:val="heading 3"/>
+    <w:basedOn w:val="Normal"/>
+    <w:qFormat/>
+    <w:rPr>
+      <w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/>
+      <w:b/>
+      <w:sz w:val="26"/>
+      <w:color w:val="334155"/>
+    </w:rPr>
+  </w:style>
+</w:styles>`);
+
+  // 5. word/document.xml
+  let bodyXml = '';
+
+  for (let pIdx = 0; pIdx < pagesData.length; pIdx++) {
+    const page = pagesData[pIdx];
+
+    if (pIdx > 0) {
+      bodyXml += `
+    <w:p>
+      <w:r>
+        <w:br w:type="page"/>
+      </w:r>
+    </w:p>`;
+    }
+
+    for (const block of page.blocks) {
+      if (block.type === 'table') {
+        let rowsXml = '';
+        for (const row of block.rows) {
+          let cellsXml = '';
+          for (const cell of row) {
+            cellsXml += `
+          <w:tc>
+            <w:tcPr>
+              <w:tcMar>
+                <w:top w:w="120" w:type="dxa"/>
+                <w:bottom w:w="120" w:type="dxa"/>
+                <w:left w:w="160" w:type="dxa"/>
+                <w:right w:w="160" w:type="dxa"/>
+              </w:tcMar>
+            </w:tcPr>
+            <w:p>
+              <w:r>
+                <w:rPr>
+                  <w:rFonts w:ascii="${xmlEscape(cell.fontFamily || 'Calibri')}" w:hAnsi="${xmlEscape(cell.fontFamily || 'Calibri')}"/>
+                  ${cell.isBold ? '<w:b/>' : ''}
+                  ${cell.isItalic ? '<w:i/>' : ''}
+                  <w:sz w:val="${Math.round((cell.fontSize || 10) * 2)}"/>
+                  <w:color w:val="1E293B"/>
+                </w:rPr>
+                <w:t xml:space="preserve">${xmlEscape(cell.text)}</w:t>
+              </w:r>
+            </w:p>
+          </w:tc>`;
+          }
+          rowsXml += `
+        <w:tr>
+          ${cellsXml}
+        </w:tr>`;
+        }
+
+        bodyXml += `
+    <w:tbl>
+      <w:tblPr>
+        <w:tblW w:w="0" w:type="auto"/>
+        <w:tblBorders>
+          <w:top w:val="single" w:sz="4" w:space="0" w:color="CBD5E1"/>
+          <w:left w:val="single" w:sz="4" w:space="0" w:color="CBD5E1"/>
+          <w:bottom w:val="single" w:sz="4" w:space="0" w:color="CBD5E1"/>
+          <w:right w:val="single" w:sz="4" w:space="0" w:color="CBD5E1"/>
+          <w:insideH w:val="single" w:sz="4" w:space="0" w:color="E2E8F0"/>
+          <w:insideV w:val="single" w:sz="4" w:space="0" w:color="E2E8F0"/>
+        </w:tblBorders>
+      </w:tblPr>
+      ${rowsXml}
+    </w:tbl>`;
+      } else {
+        const jcVal = block.alignment || 'left';
+        let styleXml = '';
+        if (block.type === 'heading') {
+          const sId = block.headingLevel === 1 ? 'Heading1' : block.headingLevel === 2 ? 'Heading2' : 'Heading3';
+          styleXml = `<w:pStyle w:val="${sId}"/>`;
+        }
+
+        const spaceBefore = block.type === 'heading' ? '200' : '60';
+        const spaceAfter = block.type === 'heading' ? '120' : '100';
+
+        let runsXml = '';
+        for (const run of block.runs) {
+          runsXml += `
+      <w:r>
+        <w:rPr>
+          <w:rFonts w:ascii="${xmlEscape(run.fontFamily || 'Calibri')}" w:hAnsi="${xmlEscape(run.fontFamily || 'Calibri')}"/>
+          ${run.isBold ? '<w:b/>' : ''}
+          ${run.isItalic ? '<w:i/>' : ''}
+          <w:sz w:val="${Math.round((run.fontSize || 11) * 2)}"/>
+          <w:color w:val="${block.type === 'heading' ? '1E3A8A' : '1E293B'}"/>
+        </w:rPr>
+        <w:t xml:space="preserve">${xmlEscape(run.str)}</w:t>
+      </w:r>`;
+        }
+
+        bodyXml += `
+    <w:p>
+      <w:pPr>
+        ${styleXml}
+        <w:jc w:val="${jcVal}"/>
+        <w:spacing w:before="${spaceBefore}" w:after="${spaceAfter}" w:line="260" w:lineRule="auto"/>
+      </w:pPr>
+      ${runsXml}
+    </w:p>`;
+      }
+    }
+  }
+
+  const firstPage = pagesData[0] || { pageWidth: 595.3, pageHeight: 841.9 };
+  const pgW = Math.round((firstPage.pageWidth || 595.3) * 20);
+  const pgH = Math.round((firstPage.pageHeight || 841.9) * 20);
+
+  const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>
+    ${bodyXml}
+    <w:sectPr>
+      <w:pgSz w:w="${pgW}" w:h="${pgH}"/>
+      <w:pgMar w:top="1080" w:right="1080" w:bottom="1080" w:left="1080" w:header="720" w:footer="720" w:gutter="0"/>
+    </w:sectPr>
+  </w:body>
+</w:document>`;
+
+  zip.file('word/document.xml', documentXml);
+
+  return await zip.generateAsync({
+    type: 'blob',
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    compression: 'DEFLATE'
+  });
+}
+
+/**
+ * Build rich MSO Word HTML document (.doc)
+ */
+function buildMsoDocHtml(pagesData, docTitle, layoutMode = 'smart_layout') {
+  const pageHtmls = [];
+
+  for (let pIdx = 0; pIdx < pagesData.length; pIdx++) {
+    const page = pagesData[pIdx];
+    let pageContentHtml = '';
+
+    if (layoutMode === 'exact_visual') {
+      const visualItemsHtml = page.lines.map(line => {
+        const lineContent = line.runs.map(r => {
+          const boldStyle = r.isBold ? 'font-weight:bold;' : '';
+          const italicStyle = r.isItalic ? 'font-style:italic;' : '';
+          return `<span style="font-family:'${r.fontFamily}', sans-serif; font-size:${r.fontSize}pt; ${boldStyle} ${italicStyle}">${xmlEscape(r.str)}</span>`;
+        }).join('&nbsp;');
+
+        return `<div style="position:absolute; left:${Math.round(line.minX)}pt; top:${Math.round(line.y)}pt; font-size:${line.avgFontSize}pt; white-space:nowrap; text-align:${line.alignment};">${lineContent}</div>`;
+      }).join('\n');
+
+      pageContentHtml = `
+        <div style="position:relative; width:${page.pageWidth}pt; min-height:${page.pageHeight}pt; margin-bottom:24pt; overflow:hidden;">
+          ${visualItemsHtml}
+        </div>
+      `;
+    } else {
+      const blocksHtml = page.blocks.map(block => {
+        if (block.type === 'table') {
+          const trs = block.rows.map(row => {
+            const tds = row.map(cell => {
+              const bStyle = cell.isBold ? 'font-weight:bold;' : '';
+              const iStyle = cell.isItalic ? 'font-style:italic;' : '';
+              return `<td style="border:1px solid #cbd5e1; padding:6pt 8pt; font-size:${cell.fontSize || 10}pt; font-family:'${cell.fontFamily}', sans-serif; ${bStyle} ${iStyle}">${xmlEscape(cell.text)}</td>`;
+            }).join('');
+            return `<tr>${tds}</tr>`;
+          }).join('\n');
+
+          return `<table style="border-collapse:collapse; width:100%; margin:10pt 0;">${trs}</table>`;
+        } else if (block.type === 'heading') {
+          const tag = block.headingLevel === 1 ? 'h1' : block.headingLevel === 2 ? 'h2' : 'h3';
+          const inner = block.runs.map(r => xmlEscape(r.str)).join(' ');
+          return `<${tag} style="text-align:${block.alignment}; margin-top:14pt; margin-bottom:6pt; color:#1e3a8a;">${inner}</${tag}>`;
+        } else if (block.type === 'bullet') {
+          const inner = block.runs.map(r => {
+            const bStyle = r.isBold ? 'font-weight:bold;' : '';
+            const iStyle = r.isItalic ? 'font-style:italic;' : '';
+            return `<span style="font-family:'${r.fontFamily}', sans-serif; font-size:${r.fontSize}pt; ${bStyle} ${iStyle}">${xmlEscape(r.str)}</span>`;
+          }).join(' ');
+          return `<p style="margin:4pt 0 4pt 18pt; text-align:${block.alignment};">${inner}</p>`;
+        } else {
+          const inner = block.runs.map(r => {
+            const bStyle = r.isBold ? 'font-weight:bold;' : '';
+            const iStyle = r.isItalic ? 'font-style:italic;' : '';
+            return `<span style="font-family:'${r.fontFamily}', sans-serif; font-size:${r.fontSize}pt; ${bStyle} ${iStyle}">${xmlEscape(r.str)}</span>`;
+          }).join(' ');
+          return `<p style="margin:0 0 8pt 0; text-align:${block.alignment}; line-height:1.45;">${inner}</p>`;
+        }
+      }).join('\n');
+
+      pageContentHtml = `<div>${blocksHtml}</div>`;
+    }
+
+    pageHtmls.push(pageContentHtml);
+  }
+
+  const firstPage = pagesData[0] || { pageWidth: 595.3, pageHeight: 841.9 };
+
+  return `
     <html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
-    <head><meta charset='utf-8'><title>Converted PDF Document</title>
-    <style>
-      body { font-family: 'Calibri', 'Segoe UI', sans-serif; font-size: 11pt; line-height: 1.5; margin: 1in; }
-      h1, h2, h3 { color: #1e3a8a; }
-      p { margin-bottom: 10pt; }
-    </style>
+    <head>
+      <meta charset='utf-8'>
+      <title>${xmlEscape(docTitle)}</title>
+      <!--[if gte mso 9]>
+      <xml>
+        <w:WordDocument>
+          <w:View>Print</w:View>
+          <w:Zoom>100</w:Zoom>
+          <w:DoNotOptimizeForBrowser/>
+        </w:WordDocument>
+      </xml>
+      <![endif]-->
+      <style>
+        @page Section1 {
+          size: ${firstPage.pageWidth}pt ${firstPage.pageHeight}pt;
+          margin: 54pt 54pt 54pt 54pt;
+          mso-header-margin: 36pt;
+          mso-footer-margin: 36pt;
+          mso-paper-source: 0;
+        }
+        div.Section1 { page: Section1; }
+        body { font-family: 'Calibri', 'Segoe UI', Arial, sans-serif; font-size: 11pt; color: #1e293b; line-height: 1.45; }
+        h1 { font-size: 20pt; font-weight: bold; color: #1e3a8a; }
+        h2 { font-size: 16pt; font-weight: bold; color: #1e3a8a; }
+        h3 { font-size: 13pt; font-weight: bold; color: #334155; }
+        p { margin-bottom: 8pt; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #cbd5e1; padding: 6pt 8pt; vertical-align: top; }
+      </style>
     </head>
     <body>
-      ${text.split('\n\n').map(p => `<p>${p.replace(/\n/g, '<br/>')}</p>`).join('')}
+      <div class="Section1">
+        ${pageHtmls.join('<br clear="all" style="page-break-before:always; mso-break-type:section-break" />')}
+      </div>
     </body>
     </html>
   `;
+}
 
-  return {
-    data: new Blob([wordDocContent], { type: 'application/msword;charset=utf-8' }),
-    filename: (file.name ? file.name.replace(/\.pdf$/i, '') : 'document') + '.doc',
-    textContent: text
-  };
+/**
+ * Convert PDF to Word (.docx / .doc) with 100% Preserved Formatting, Typography & Tables
+ */
+export async function convertPdfToWord(file, options = {}) {
+  const { loadPdfDocument } = await import('./pdfViewerEngine');
+  const pdfDoc = await loadPdfDocument(file);
+  const totalPages = pdfDoc.numPages;
+  const docTitle = file.name ? file.name.replace(/\.pdf$/i, '') : 'document';
+  const outputFormat = options.outputFormat || 'docx';
+  const layoutMode = options.layoutMode || 'smart_layout';
+
+  const pagesData = [];
+  let extractedFullText = '';
+
+  for (let i = 1; i <= totalPages; i++) {
+    const page = await pdfDoc.getPage(i);
+    const layout = await analyzePageLayout(page);
+    pagesData.push(layout);
+
+    const pageText = layout.lines.map(l => l.fullText).join('\n');
+    extractedFullText += `--- Page ${i} ---\n` + pageText + '\n\n';
+  }
+
+  if (outputFormat === 'doc') {
+    const htmlContent = buildMsoDocHtml(pagesData, docTitle, layoutMode);
+    return {
+      data: new Blob([htmlContent], { type: 'application/msword;charset=utf-8' }),
+      filename: `${docTitle}.doc`,
+      textContent: extractedFullText
+    };
+  } else {
+    // Default to modern DOCX (Microsoft Word OpenXML standard)
+    const docxBlob = await buildDocxArchive(pagesData, docTitle);
+    return {
+      data: docxBlob,
+      filename: `${docTitle}.docx`,
+      textContent: extractedFullText
+    };
+  }
 }
 
 /**

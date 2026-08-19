@@ -212,9 +212,9 @@ export default function ToolModal({ tool, isOpen, onClose, onAddHistory }) {
       else if (tool.id === 'pdf-to-img') {
         outputResult = await convertPdfToImages(files[0], formValues);
       }
-      // PDF to Word (.doc)
+      // PDF to Word (.docx / .doc)
       else if (tool.id === 'pdf-to-word') {
-        outputResult = await convertPdfToWord(files[0]);
+        outputResult = await convertPdfToWord(files[0], formValues);
       }
       // PDF to PowerPoint (.pptx)
       else if (tool.id === 'pdf-to-ppt') {

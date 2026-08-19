@@ -512,8 +512,8 @@ export const TOOLS = [
   },
   {
     id: 'pdf-to-word',
-    title: 'PDF to Word (.doc)',
-    description: 'Convert PDF documents into editable Microsoft Word (.doc) format with preserved text formatting.',
+    title: 'PDF to Word (.docx / .doc)',
+    description: 'Convert PDF documents into fully editable Microsoft Word (.docx / .doc) format with preserved typography, fonts, headings, tables, and page layout.',
     category: 'convert-from',
     icon: 'FileText',
     color: 'from-blue-600 to-indigo-700',
@@ -521,7 +521,28 @@ export const TOOLS = [
     multiple: false,
     badge: 'DOCX / DOC',
     type: 'standard',
-    fields: []
+    fields: [
+      {
+        id: 'outputFormat',
+        label: 'Word File Format',
+        type: 'select',
+        defaultValue: 'docx',
+        options: [
+          { value: 'docx', label: 'Microsoft Word OpenXML (.docx - Modern Standard)' },
+          { value: 'doc', label: 'Microsoft Word Document (.doc - Legacy & Web)' }
+        ]
+      },
+      {
+        id: 'layoutMode',
+        label: 'Layout & Formatting Engine',
+        type: 'select',
+        defaultValue: 'smart_layout',
+        options: [
+          { value: 'smart_layout', label: 'Smart Formatted Flow (Preserves exact fonts, sizes, bold/italic, tables & headings)' },
+          { value: 'exact_visual', label: 'Exact Visual Layout (Preserves absolute coordinates and visual placement)' }
+        ]
+      }
+    ]
   },
   {
     id: 'pdf-to-ppt',
